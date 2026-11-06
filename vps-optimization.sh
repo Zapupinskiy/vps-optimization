@@ -18,7 +18,7 @@ command -v apt-get >/dev/null || die "Нужна Ubuntu/Debian с apt."
 STAMP=$(date +%Y%m%d-%H%M%S)
 BACKUP="/root/vps-optimization-backup-$STAMP"
 mkdir -p "$BACKUP"
-backup(){ [[ -e "$1" ]] && { mkdir -p "$BACKUP$(dirname "$1")"; cp -a "$1" "$BACKUP$1"; }; }
+backup(){ if [[ -e "$1" ]]; then mkdir -p "$BACKUP$(dirname "$1")"; cp -a "$1" "$BACKUP$1"; fi; return 0; }
 
 say "Информация о сервере"
 echo "OS: ${PRETTY_NAME:-unknown}"
@@ -140,15 +140,24 @@ grep -qxF "$SSH_PUBLIC_KEY" /root/.ssh/authorized_keys || printf '%s\n' "$SSH_PU
 backup /etc/ssh/sshd_config
 mkdir -p /etc/ssh/sshd_config.d
 DROPIN=/etc/ssh/sshd_config.d/00-vps-optimization.conf
+while IFS= read -r -d '' cfg; do backup "$cfg"; done < <(find /etc/ssh/sshd_config.d -maxdepth 1 -type f -name '*.conf' -print0)
+
+# Remove active Port directives from existing files so SSH listens only on 1679.
+while IFS= read -r -d '' cfg; do
+  [[ "$cfg" == "$DROPIN" ]] && continue
+  sed -i -E 's/^([[:space:]]*)Port([[:space:]]+)/# managed by vps-optimization: Port\2/' "$cfg"
+done < <(find /etc/ssh -maxdepth 2 -type f \( -name 'sshd_config' -o -path '/etc/ssh/sshd_config.d/*.conf' \) -print0)
+
 backup "$DROPIN"
 cat > "$DROPIN" <<EOF
 Port $SSH_PORT
 PubkeyAuthentication yes
 EOF
 if ! sshd -t; then
+  warn "Проверка sshd не прошла. Восстанавливаю конфигурации SSH из резервной копии."
   [[ -e "$BACKUP/etc/ssh/sshd_config" ]] && cp -a "$BACKUP/etc/ssh/sshd_config" /etc/ssh/sshd_config
-  [[ -e "$BACKUP$DROPIN" ]] && cp -a "$BACKUP$DROPIN" "$DROPIN" || rm -f "$DROPIN"
-  die "Проверка sshd не прошла; изменения SSH отменены насколько возможно."
+  if [[ -d "$BACKUP/etc/ssh/sshd_config.d" ]]; then cp -a "$BACKUP/etc/ssh/sshd_config.d/." /etc/ssh/sshd_config.d/; else rm -f "$DROPIN"; fi
+  die "SSH-конфигурация не применена."
 fi
 
 # If UFW is already active, permit the new port before reloading SSH.
