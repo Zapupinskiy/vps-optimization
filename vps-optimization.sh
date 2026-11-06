@@ -1,54 +1,41 @@
 #!/usr/bin/env bash
-# Universal, conservative VPS baseline for Ubuntu 22.04/24.04.
-# Run as root. Review before use; UFW activation is explicitly optional.
-
+# Универсальная базовая настройка Ubuntu VPS. Не задаёт вопросов.
+# SSH: порт 1679 + заданный публичный ключ. UFW автоматически НЕ включается.
 set -Eeuo pipefail
 umask 077
-
-LOG="/var/log/vps-optimization.log"
+LOG=/var/log/vps-optimization.log
 exec > >(tee -a "$LOG") 2>&1
+say(){ printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
+warn(){ printf '[WARNING] %s\n' "$*" >&2; }
+die(){ printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-say()  { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
-warn() { printf '\n[WARNING] %s\n' "$*" >&2; }
-die()  { printf '\n[ERROR] %s\n' "$*" >&2; exit 1; }
-
-[[ $EUID -eq 0 ]] || die "Запусти скрипт от root: sudo bash $0"
-command -v apt-get >/dev/null 2>&1 || die "Этот скрипт предназначен для Ubuntu/Debian с apt."
+[[ $EUID -eq 0 ]] || die "Запусти от root."
+command -v apt-get >/dev/null || die "Нужна Ubuntu/Debian с apt."
 . /etc/os-release
-[[ "${ID:-}" == "ubuntu" || "${ID_LIKE:-}" == *"debian"* ]] || die "Поддерживаются Ubuntu и Debian-подобные системы."
-[[ "${VERSION_ID:-}" == "22.04" || "${VERSION_ID:-}" == "24.04" || "${ID:-}" == "debian" ]] || warn "Версия ОС не проверялась. Продолжаю с консервативными настройками."
+[[ "${ID:-}" == ubuntu || "${ID_LIKE:-}" == *debian* ]] || die "Поддерживается Ubuntu/Debian."
+[[ "${VERSION_ID:-}" == 22.04 || "${VERSION_ID:-}" == 24.04 || "${ID:-}" == debian ]] || warn "Версия ОС не проверялась."
 
-STAMP="$(date +%Y%m%d-%H%M%S)"
+STAMP=$(date +%Y%m%d-%H%M%S)
 BACKUP="/root/vps-optimization-backup-$STAMP"
 mkdir -p "$BACKUP"
-say "Резервная копия изменяемых файлов: $BACKUP"
+backup(){ [[ -e "$1" ]] && { mkdir -p "$BACKUP$(dirname "$1")"; cp -a "$1" "$BACKUP$1"; }; }
 
-backup_file() {
-  local f="$1"
-  if [[ -e "$f" ]]; then
-    mkdir -p "$BACKUP$(dirname "$f")"
-    cp -a "$f" "$BACKUP$f"
-  fi
-}
+say "Информация о сервере"
+echo "OS: ${PRETTY_NAME:-unknown}"
+echo "Kernel: $(uname -r)"
+echo "CPU: $(nproc)"
+free -h
+df -h /
 
-say "Сбор исходной информации"
-printf 'OS: %s %s\n' "${PRETTY_NAME:-unknown}" "${VERSION_ID:-}"
-printf 'Kernel: %s\n' "$(uname -r)"
-printf 'CPU: %s vCPU\n' "$(nproc)"
-printf 'RAM: %s\n' "$(free -h | awk '/^Mem:/ {print $2}')"
-printf 'Disk: %s свободно в /\n' "$(df -hP / | awk 'NR==2 {print $4}')"
-
-say "Обновление списка пакетов и установка базовых инструментов"
+say "Установка базовых пакетов"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends \
-  ca-certificates curl jq unattended-upgrades fail2ban ufw
+apt-get install -y --no-install-recommends ca-certificates curl jq unattended-upgrades fail2ban ufw
 
-say "Настройка безопасных системных параметров"
-SYSCTL_FILE="/etc/sysctl.d/99-vps-baseline.conf"
-backup_file "$SYSCTL_FILE"
-cat > "$SYSCTL_FILE" <<'EOF'
-# Conservative baseline. No aggressive buffer or queue tuning.
+say "Оптимизация sysctl"
+SYSCTL=/etc/sysctl.d/99-vps-baseline.conf
+backup "$SYSCTL"
+cat > "$SYSCTL" <<'EOF'
 fs.file-max = 1048576
 net.core.somaxconn = 2048
 net.ipv4.tcp_syncookies = 1
@@ -59,45 +46,38 @@ net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.ip_local_port_range = 10240 65535
 vm.swappiness = 10
 EOF
-
-# Enable BBR only when the running kernel explicitly reports support.
-AVAILABLE_CC="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-if grep -qw bbr <<< "$AVAILABLE_CC"; then
-  cat >> "$SYSCTL_FILE" <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-  say "BBR поддерживается ядром: включаю BBR + fq."
+CC=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+if grep -qw bbr <<< "$CC"; then
+  printf '%s\n' 'net.core.default_qdisc = fq' 'net.ipv4.tcp_congestion_control = bbr' >> "$SYSCTL"
+  say "Включён BBR + fq."
 else
-  say "BBR не обнаружен в текущем ядре: оставляю штатный алгоритм TCP."
+  say "BBR недоступен в текущем ядре; оставлен штатный TCP congestion control."
 fi
-
 sysctl --system
 
-say "Настройка системных лимитов"
-LIMITS_FILE="/etc/security/limits.d/99-vps-baseline.conf"
-backup_file "$LIMITS_FILE"
-cat > "$LIMITS_FILE" <<'EOF'
+say "Системные лимиты"
+LIMITS=/etc/security/limits.d/99-vps-baseline.conf
+backup "$LIMITS"
+cat > "$LIMITS" <<'EOF'
 * soft nofile 65535
 * hard nofile 65535
 root soft nofile 65535
 root hard nofile 65535
 EOF
-
-SYSTEMD_DROPIN="/etc/systemd/system.conf.d/99-vps-baseline.conf"
-backup_file "$SYSTEMD_DROPIN"
 mkdir -p /etc/systemd/system.conf.d
-cat > "$SYSTEMD_DROPIN" <<'EOF'
+SDROP=/etc/systemd/system.conf.d/99-vps-baseline.conf
+backup "$SDROP"
+cat > "$SDROP" <<'EOF'
 [Manager]
 DefaultLimitNOFILE=65535
 EOF
 systemctl daemon-reexec
 
-say "Настройка journald: ограничение размера системных журналов"
-JOURNAL_FILE="/etc/systemd/journald.conf.d/99-vps-baseline.conf"
-backup_file "$JOURNAL_FILE"
+say "Ограничение системных журналов"
 mkdir -p /etc/systemd/journald.conf.d
-cat > "$JOURNAL_FILE" <<'EOF'
+JOURNAL=/etc/systemd/journald.conf.d/99-vps-baseline.conf
+backup "$JOURNAL"
+cat > "$JOURNAL" <<'EOF'
 [Journal]
 SystemMaxUse=500M
 SystemMaxFileSize=50M
@@ -105,11 +85,11 @@ MaxRetentionSec=14day
 EOF
 systemctl restart systemd-journald
 
-say "Настройка Fail2ban для SSH"
-JAIL_FILE="/etc/fail2ban/jail.d/99-vps-sshd.local"
-backup_file "$JAIL_FILE"
+say "Fail2ban для SSH"
+JAIL=/etc/fail2ban/jail.d/99-vps-sshd.local
+backup "$JAIL"
 mkdir -p /etc/fail2ban/jail.d
-cat > "$JAIL_FILE" <<'EOF'
+cat > "$JAIL" <<'EOF'
 [sshd]
 enabled = true
 backend = systemd
@@ -120,79 +100,83 @@ EOF
 systemctl enable --now fail2ban
 systemctl restart fail2ban
 
-say "Настройка автоматической установки обновлений безопасности"
-AUTO_FILE="/etc/apt/apt.conf.d/20auto-upgrades"
-backup_file "$AUTO_FILE"
-cat > "$AUTO_FILE" <<'EOF'
+say "Автоматические обновления безопасности"
+AUTO=/etc/apt/apt.conf.d/20auto-upgrades
+backup "$AUTO"
+cat > "$AUTO" <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
 systemctl enable --now unattended-upgrades 2>/dev/null || true
 
-say "Проверка Swap"
+say "Swap: автоматическое решение"
 if ! swapon --show --noheadings | grep -q .; then
-  RAM_KB="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
-  FREE_KB="$(df -Pk / | awk 'NR==2 {print $4}')"
+  RAM_KB=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+  FREE_KB=$(df -Pk / | awk 'NR==2 {print $4}')
   if (( RAM_KB <= 2097152 && FREE_KB >= 2097152 )); then
-    read -r -p "Обнаружено RAM до 2 ГБ. Создать файл подкачки 1 ГБ? [y/N]: " MAKE_SWAP
-    if [[ "$MAKE_SWAP" =~ ^[YyДд]$ ]]; then
-      if ! fallocate -l 1G /swapfile 2>/dev/null; then
-        dd if=/dev/zero of=/swapfile bs=1M count=1024 status=progress
-      fi
-      chmod 600 /swapfile
-      mkswap /swapfile
-      swapon /swapfile
-      grep -qE '^/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-      say "Swap 1 ГБ создан и добавлен в /etc/fstab."
-    else
-      say "Создание Swap пропущено."
-    fi
+    if ! fallocate -l 1G /swapfile 2>/dev/null; then dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none; fi
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    grep -qE '^/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    say "Создан Swap 1 ГБ."
   else
-    say "Swap не создаю автоматически: объём RAM/свободного диска не требует этого."
+    say "Swap не создавался: существующий объём RAM/диска достаточен."
   fi
 else
-  say "Swap уже настроен, не изменяю."
+  say "Swap уже существует; без изменений."
 fi
 
-say "Настройка UFW без автоматического включения"
-# Determine the actual SSH listening port before adding an allow rule.
-SSH_PORT="22"
-if command -v sshd >/dev/null 2>&1; then
-  DETECTED_PORT="$(sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}')"
-  [[ "$DETECTED_PORT" =~ ^[0-9]+$ ]] && SSH_PORT="$DETECTED_PORT"
+say "SSH: установка ключа и перенос на порт 1679"
+SSH_PORT=1679
+SSH_PUBLIC_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOZTi0QLLLpfWCEtDB2rIcIyMUXGdHvylhtbW5xwEtC0 Generated By Termius'
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+touch /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+grep -qxF "$SSH_PUBLIC_KEY" /root/.ssh/authorized_keys || printf '%s\n' "$SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys
+
+backup /etc/ssh/sshd_config
+mkdir -p /etc/ssh/sshd_config.d
+DROPIN=/etc/ssh/sshd_config.d/00-vps-optimization.conf
+backup "$DROPIN"
+cat > "$DROPIN" <<EOF
+Port $SSH_PORT
+PubkeyAuthentication yes
+EOF
+if ! sshd -t; then
+  [[ -e "$BACKUP/etc/ssh/sshd_config" ]] && cp -a "$BACKUP/etc/ssh/sshd_config" /etc/ssh/sshd_config
+  [[ -e "$BACKUP$DROPIN" ]] && cp -a "$BACKUP$DROPIN" "$DROPIN" || rm -f "$DROPIN"
+  die "Проверка sshd не прошла; изменения SSH отменены насколько возможно."
 fi
-ufw allow "${SSH_PORT}/tcp" comment 'SSH access' || true
+
+# If UFW is already active, permit the new port before reloading SSH.
+ufw allow "${SSH_PORT}/tcp" comment 'SSH port 1679' || true
+if systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; then
+  say "SSH перезагружен с портом $SSH_PORT."
+else
+  warn "Не удалось перезагрузить SSH автоматически. Текущую сессию не закрывай."
+fi
+
+say "UFW: безопасный режим без автоматического включения"
+ufw allow "${SSH_PORT}/tcp" comment 'SSH port 1679' || true
 ufw default deny incoming
 ufw default allow outgoing
-ufw status verbose || true
-
-cat <<EOF
-
-UFW подготовлен. SSH-порт ${SSH_PORT}/tcp разрешён.
-ВНИМАНИЕ: включение UFW может закрыть доступ к другим сервисам
-(например, панели, VPN, DNS, веб-серверу), если их порты не разрешены.
-EOF
-read -r -p "Включить UFW сейчас? Сначала добавь правила для всех нужных портов. [y/N]: " ENABLE_UFW
-if [[ "$ENABLE_UFW" =~ ^[YyДд]$ ]]; then
-  ufw --force enable
-  say "UFW включён."
+if ufw status 2>/dev/null | grep -q 'Status: active'; then
+  say "UFW уже включён; правило порта 1679 добавлено. Остальные сервисные порты проверь отдельно."
 else
-  say "UFW оставлен выключенным. Правило SSH уже добавлено."
+  say "UFW оставлен выключенным, чтобы не отрезать доступ к VPN/панели."
 fi
 
-say "Проверка состояния"
-systemctl is-active --quiet fail2ban && echo "Fail2ban: active" || warn "Fail2ban не активен."
-systemctl is-active --quiet systemd-journald && echo "journald: active" || warn "journald не активен."
-echo
-echo "TCP congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-echo "Open files limit (current shell): $(ulimit -n)"
-echo "Swap:"
+say "Итоговая проверка"
+sshd -T 2>/dev/null | awk '$1=="port" || $1=="pubkeyauthentication" || $1=="passwordauthentication" {print}'
+systemctl is-active fail2ban || true
+sysctl net.ipv4.tcp_congestion_control
+ulimit -n
 swapon --show || true
-echo
-echo "UFW:"
 ufw status verbose || true
-
-say "Готово. Резервные копии: $BACKUP"
-echo "Лог выполнения: $LOG"
-echo "Перезагрузка не выполнялась. Если обновлялось ядро, запланируй перезагрузку отдельно."
+echo "Резервные копии: $BACKUP"
+echo "Лог: $LOG"
+echo "Готово. Перезагрузка сервера не выполнялась."
+echo "Открой вторую SSH-сессию на порт 1679 и проверь вход по ключу, не закрывая текущую."
